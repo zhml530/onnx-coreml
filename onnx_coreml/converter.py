@@ -10,6 +10,7 @@ import numpy as np
 from onnx import shape_inference
 from onnx import TensorProto
 
+import coremltools as ct
 from coremltools.models.neural_network import NeuralNetworkBuilder  #type: ignore
 from coremltools.models import datatypes, MLModel  #type: ignore
 from coremltools.proto import FeatureTypes_pb2 as ft  #type: ignore
@@ -32,7 +33,11 @@ from ._transformers import ConvAddFuser, DropoutRemover, \
     DeadCodeElimination, PaddingOpRemover
 
 # ML model passes
-from coremltools.converters.nnssa.coreml.graph_pass.mlmodel_passes import remove_disconnected_layers, transform_conv_crop
+try:
+    from coremltools.converters.nnssa.coreml.graph_pass.mlmodel_passes import remove_disconnected_layers, transform_conv_crop
+except:
+    remove_disconnected_layers = None
+    transform_conv_crop = None
 
 from ._error_utils import ErrorHandling
 from .graph_viz import plot_graph # type: ignore
@@ -101,13 +106,16 @@ def _make_coreml_input_features(graph, onnx_coreml_input_shape_map, disable_core
         if disable_coreml_rank5_mapping:
             if len(shape) > 5:
                 raise ValueError('ONNX input %s has a rank greater than 5, which is not supported in CoreML framework' % str(input_[0]))
+            elif input_[0] in onnx_coreml_input_shape_map:
+                shape = onnx_coreml_input_shape_map[input_[0]]
+                features.append((str(input_[0]), datatypes.Array(*shape)))
             else:
                 features.append((str(input_[0]), datatypes.Array(*shape)))
             continue
 
         if USE_SHAPE_MAPPING and input_[0] in onnx_coreml_input_shape_map:
             mapp = onnx_coreml_input_shape_map[input_[0]]
-            if len(mapp) != len(shape):
+            if isinstance(mapp, list) and len(mapp) != len(shape):
                 raise ValueError('Incorrect value in onnx_coreml_input_shape_map argument')
             graph.onnx_coreml_shape_mapping[input_[0]] = mapp
             coreml_shape = [1,1,1]
@@ -161,7 +169,7 @@ def _make_coreml_input_features(graph, onnx_coreml_input_shape_map, disable_core
 outputs: list of tuples.
       [Tuple]: [(name, type, shape)]
 '''
-def _make_coreml_output_features(graph, forceShape=False, disable_coreml_rank5_mapping=False):  # type: (...) -> Sequence[Tuple[Text, datatypes.Array]]
+def _make_coreml_output_features(graph, forceShape=False, onnx_coreml_output_shape_map={}, disable_coreml_rank5_mapping=False):  # type: (...) -> Sequence[Tuple[Text, datatypes.Array]]
     features = []
     outputs = graph.outputs
     op_types = graph.blob_from_op_type
@@ -176,6 +184,9 @@ def _make_coreml_output_features(graph, forceShape=False, disable_coreml_rank5_m
             shape = output_[2]
             if len(shape) > 5:
                 raise ValueError('ONNX output %s has a rank greater than 5, which is not supported in CoreML framework' % str(output_[0]))
+            elif output_[0] in onnx_coreml_output_shape_map:
+                shape = onnx_coreml_output_shape_map[output_[0]]
+                features.append((str(output_[0]), datatypes.Array(*shape)))
             else:
                 features.append((str(output_[0]), datatypes.Array(*shape)))
             continue
@@ -386,7 +397,9 @@ def convert(model,  # type: Union[onnx.ModelProto, Text]
             add_custom_layers = False,  # type: bool
             custom_conversion_functions = {}, #type: Dict[Text, Any]
             onnx_coreml_input_shape_map = {}, # type: Dict[Text, List[int,...]]
-            minimum_ios_deployment_target = '12'):
+            onnx_coreml_output_shape_map = {}, # type: Dict[Text, List[int,...]]
+            onnx_coreml_input_shape_range = {},
+            minimum_ios_deployment_target = '12', build_nn=False):
     # type: (...) -> MLModel
     """
     Convert ONNX model to CoreML.
@@ -548,7 +561,7 @@ def convert(model,  # type: Union[onnx.ModelProto, Text]
     if len( image_output_names) > 0:
         output_features = _make_coreml_output_features(graph, forceShape=True, disable_coreml_rank5_mapping=disable_coreml_rank5_mapping)
     else:
-        output_features = _make_coreml_output_features(graph, disable_coreml_rank5_mapping=disable_coreml_rank5_mapping)
+        output_features = _make_coreml_output_features(graph, onnx_coreml_output_shape_map=onnx_coreml_output_shape_map, disable_coreml_rank5_mapping=disable_coreml_rank5_mapping)
 
     builder = NeuralNetworkBuilder(input_features, output_features, mode=mode, disable_rank5_shape_mapping=disable_coreml_rank5_mapping)
 
@@ -723,12 +736,52 @@ def convert(model,  # type: Union[onnx.ModelProto, Text]
             if layer.WhichOneof('layer') == 'resizeBilinear' or layer.WhichOneof('layer') == 'cropResize':
                 raise TypeError('{} not supported with target iOS 11.2 please provide higher target iOS'.format(layer.WhichOneof('layer')))
 
-    # Optimize ML Model Spec
-    ml_model_passes = [remove_disconnected_layers, transform_conv_crop]
+    # remove disconnected layers if remove_disconnected_layers does not exist in coremltools
+    def remove_unused_layers(spec):
+        used_outputs = set()
+        for outputs_ in model.graph.output:
+            used_outputs.add(outputs_.name)
+        for layer in spec.neuralNetwork.layers:
+            for input_ in layer.input:
+                used_outputs.add(input_)
+
+        while True:
+            removed = False
+            for layer in spec.neuralNetwork.layers:
+                if not any(output in used_outputs for output in layer.output):
+                    layer.loadConstantND.Clear()
+                    layer.Clear()
+                    spec.neuralNetwork.layers.remove(layer)
+                    removed = True
+                    break
+            if not removed:
+                break
+
+    ml_model_passes = [remove_disconnected_layers, transform_conv_crop, remove_unused_layers]
     for opt in ml_model_passes:
-        opt(builder.spec)
+        if opt:
+            opt(builder.spec)
+    
+    spec = builder.spec
+    for input in spec.description.input:
+        if input.name in onnx_coreml_input_shape_range:
+            range = onnx_coreml_input_shape_range[input.name]
+            lower = range.get('lower', None)
+            upper = range.get('upper', None)
+            if lower and upper:
+                ct.models.neural_network.flexible_shape_utils.set_multiarray_ndshape_range(spec, input.name, lower, upper)
 
     print("Translation to CoreML spec completed. Now compiling the CoreML model.")
+
+    if build_nn:
+        try:
+            nn_spec = builder.spec
+        except RuntimeError as e:
+            raise ValueError('Compilation failed: {}'.format(str(e)))
+        
+        print('Model Compilation done.')
+        return nn_spec
+
     try:
         if DEBUG:
             import coremltools

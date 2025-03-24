@@ -49,10 +49,10 @@ setup(
         'click',
         'numpy',
         'sympy',
-        'onnx>=1.5.0',
+        'onnx==1.12.0',
         'typing>=3.6.4',
         'typing-extensions>=3.6.2.1',
-        'coremltools>=3.2',
+        'coremltools==4.0',
     ],
     setup_requires=['pytest-runner'],
     tests_require=[
@@ -65,7 +65,8 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'convert-onnx-to-coreml = onnx_coreml.bin.convert:onnx_to_coreml'
+            'convert-sld = onnx_coreml.bin.convert_sld:onnx_to_coreml',
+            'convert-landmark = onnx_coreml.bin.convert_landmark:onnx_to_coreml',
         ]
     },
 )
