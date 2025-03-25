@@ -36,8 +36,8 @@ def onnx_to_coreml(onnx_model, output):  # type: (IO[str], str) -> None
     ldmks_2d_norm_prev_shape_lower = [1, 1, 95, 2]
     ldmks_2d_norm_prev_shape_upper = [8, 1, 95, 2]
 
-    width_height_shape_lower = [1, 1, 2]
-    width_height_shape_upper = [1, 8, 2]
+    width_height_shape_lower = [1, 2]
+    width_height_shape_upper = [8, 2]
     shape_range = {
         'hidden_state_prev': {'lower': hidden_state_prev_shape_lower, 'upper': hidden_state_prev_shape_upper},
         'cell_state_prev': {'lower': cell_state_prev_shape_lower, 'upper': cell_state_prev_shape_upper},
@@ -53,7 +53,7 @@ def onnx_to_coreml(onnx_model, output):  # type: (IO[str], str) -> None
     width_height_shape = tuple(width_height_shape_lower)
     coreml_model = convert(onnx_model_proto, minimum_ios_deployment_target='13', 
                            onnx_coreml_input_shape_map={'hidden_state_prev': hidden_state_prev_shape, 'cell_state_prev': cell_state_prev_shape, 'ldmks_2d': ldmks_2d_shape, 'ldmks_2d_norm_prev': ldmks_2d_norm_prev_shape, 'width_height': width_height_shape},
-                           onnx_coreml_output_shape_map={'is_signing': [1, 1], 'sign_sigma': [1, 1], 'hidden_state': [1, 1, 128], 'cell_state': [1, 1, 128], 'ldmks_2d_norm_next_prev': [1, 1, 95, 2], 'ldmks_v_max': [1, 1], 'width_height': [1, 2]},
+                           onnx_coreml_output_shape_map={'is_signing': [1, 1], 'sign_sigma': [1, 1], 'hidden_state': [1, 1, 128], 'cell_state': [1, 1, 128], 'ldmks_2d_norm_next_prev': [1, 1, 95, 2], 'ldmks_v_max': [1, 1]},
                            onnx_coreml_input_shape_range=shape_range)
     coreml_model.version = '1.1.0'
     coreml_model.save(output)
