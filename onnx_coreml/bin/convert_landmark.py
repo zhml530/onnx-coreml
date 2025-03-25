@@ -23,8 +23,8 @@ def onnx_to_coreml(onnx_model, output):  # type: (IO[str], str) -> None
     onnx_model_proto = onnx_pb.ModelProto()
     onnx_model_proto.ParseFromString(onnx_model.read())
     coreml_model = convert(onnx_model_proto)
+    coreml_model.version = "1.1.0"
     coreml_model.save(output)
-
 
 if __name__ == '__main__':
     onnx_to_coreml()
