@@ -7,7 +7,8 @@ import numpy as np
 import copy
 
 from typing import Sequence, Callable, List, Tuple, Optional, Text, Any
-from coremltools.models.neural_network import NeuralNetworkBuilder  #type: ignore
+from coremltools import models
+from coremltools.models.neural_network import NeuralNetworkBuilder, datatypes  #type: ignore
 from onnx import TensorProto
 from ._graph import Node, Graph
 from coremltools.proto import NeuralNetwork_pb2 #type: ignore
@@ -1119,7 +1120,15 @@ def _convert_lstm(builder, node, graph, err):  # type: (NeuralNetworkBuilder, No
     # Expand dimensions of input to 5-d for compatibility
     rank = builder._get_rank(node.inputs[0])
     if rank == -1:
-        return err.unsupported_op_configuration(builder, node, graph, "Rank unknown for input")
+        if len(node.inputs) > 1:
+            weight_name = node.inputs[1]
+            if weight_name in node.input_tensors:
+                ndim = node.input_tensors[weight_name].ndim
+                rank = ndim
+
+        if rank == -1:
+            return err.unsupported_op_configuration(builder, node, graph, "Rank unknown for input")
+
     if rank < 5:
         add_nodes = 5 - rank
         # TODO: Add one expand instead of adding one after another for input, h and c
@@ -1277,7 +1286,10 @@ def _convert_lstm(builder, node, graph, err):  # type: (NeuralNetworkBuilder, No
         output_name=node.outputs[0]
     )
 
-    # Squeeze dimensions of output_h and output_c
+    # lstm output should have rank 4
+    if node.outputs[0] not in builder.rank_dict or builder._get_rank(node.outputs[0]) == 1:
+        builder.rank_dict[node.outputs[0]] = 4
+
     builder.add_squeeze(
         name=node.name+'_squeeze_out_h',
         input_name=output_h_5d,
@@ -1823,35 +1835,39 @@ def _convert_roialign(builder, node, graph, err):
     )
     node.inputs[1] += '_expanded'
 
+    target_height = target_height * sampling_ratio if sampling_ratio != 0.0 else target_height
+    target_width = target_width * sampling_ratio if sampling_ratio != 0.0 else target_width
     builder.add_crop_resize(
         name=node.name+'_crop_resize',
         input_names=[node.inputs[0], node.inputs[1]],
         output_name=node.outputs[0]+'_crop_resized',
-        target_height=target_height*sampling_ratio,
-        target_width=target_width*sampling_ratio,
-        mode='ROI_ALIGN_MODE',
+        target_height=target_height,
+        target_width=target_width,
+        mode='ALIGN_ENDPOINTS_MODE',
         box_indices_mode='CORNERS_WIDTH_FIRST',
         spatial_scale=spatial_scale
     )
 
+    use_pooling = sampling_ratio != 0.0
     builder.add_squeeze(
         name=node.name+'_squeeze',
         input_name=node.outputs[0]+'_crop_resized',
-        output_name=node.outputs[0]+'_crop_resized_squeezed',
+        output_name=node.outputs[0]+'_crop_resized_squeezed' if use_pooling else node.outputs[0],
         axes=[1]
     )
 
-    builder.add_pooling(
-        name=node.name+'_pool',
-        height=sampling_ratio,
-        width=sampling_ratio,
-        layer_type=mode,
-        input_name=node.outputs[0]+'_crop_resized_squeezed',
-        output_name=node.outputs[0],
-        stride_height=sampling_ratio,
-        stride_width=sampling_ratio,
-        padding_type='VALID'
-    )
+    if use_pooling:
+        builder.add_pooling(
+            name=node.name+'_pool',
+            height=sampling_ratio,
+            width=sampling_ratio,
+            layer_type=mode,
+            input_name=node.outputs[0]+'_crop_resized_squeezed',
+            output_name=node.outputs[0],
+            stride_height=sampling_ratio,
+            stride_width=sampling_ratio,
+            padding_type='VALID'
+        )
 
 def _convert_round(builder, node, graph, err):
     '''
@@ -2040,7 +2056,7 @@ def _convert_softmax(builder, node, graph, err):
     convert to CoreML SoftMax ND Layer:
     https://github.com/apple/coremltools/blob/655b3be5cc0d42c3c4fa49f0f0e4a93a26b3e492/mlmodel/format/NeuralNetwork.proto#3547
     '''
-    def add_softmax(output_name, rank=-1, axis=-3):
+    def add_softmax(output_name, rank=-1, axis=-3, reshape=None):
         softmax_axis = 3
         axes = list(range(5-rank))
         if axis < 0:
@@ -2089,12 +2105,24 @@ def _convert_softmax(builder, node, graph, err):
             )
             softmax_output_name += '_transposed_back'
         
-        builder.add_squeeze(
-            name=node.name+'_squeeze_dims',
-            input_name=softmax_output_name,
-            output_name=output_name,
-            axes=axes
-        )
+        # squeeze does not work for dyn shape, use a final reshape to handle all squeeze
+        if reshape:
+            reshape_output_name = output_name + '_reshape'
+            builder.add_squeeze(
+                name=node.name+'_squeeze_dims',
+                input_name=softmax_output_name,
+                output_name=reshape_output_name,
+                axes=axes
+            )
+
+            builder.add_reshape_static('softmax_reshape', reshape_output_name, output_name, output_shape=reshape)
+        else:
+            builder.add_squeeze(
+                name=node.name+'_squeeze_dims',
+                input_name=softmax_output_name,
+                output_name=output_name,
+                axes=axes
+            )
 
     axis = node.attrs.get('axis', 1)
     rank = builder._get_rank(node.inputs[0])
@@ -2110,7 +2138,12 @@ def _convert_softmax(builder, node, graph, err):
             mode='log'
         )
     else:
-        add_softmax(node.outputs[0], rank=rank, axis=axis)
+        output_name = node.outputs[0]
+        output_shape = graph.shape_dict.get(output_name, None)
+        if isinstance(output_shape, tuple) and output_shape[0] == 0:
+            output_shape = list(output_shape)
+            output_shape[0] = -1
+        add_softmax(output_name, rank=rank, axis=axis, reshape=output_shape)
 
 def _convert_split(builder, node, graph, err):
     '''
@@ -2146,7 +2179,15 @@ def _convert_squeeze(builder, node, graph, err):
     convert to CoreML Squeeze Layer:
     https://github.com/apple/coremltools/blob/655b3be5cc0d42c3c4fa49f0f0e4a93a26b3e492/mlmodel/format/NeuralNetwork.proto#L4903
     '''
+
+    # handle axes from input instead of from attr
     axes = node.attrs.get('axes', None)
+    if not axes and len(node.inputs) > 1:
+        load_input_constants(builder, node, graph, err)
+        axes_name = node.inputs[1]
+        if axes_name in node.input_tensors:
+            axes = node.input_tensors[axes_name]
+
     builder.add_squeeze(
         name=node.name,
         input_name=node.inputs[0],
@@ -2237,6 +2278,12 @@ def _convert_unsqueeze(builder, node, graph, err):
     https://github.com/apple/coremltools/blob/655b3be5cc0d42c3c4fa49f0f0e4a93a26b3e492/mlmodel/format/NeuralNetwork.proto#L4810
     '''
     axes = node.attrs.get('axes')
+    # handle axes from input instead of from attr
+    if not axes and len(node.inputs) > 1:
+        load_input_constants(builder, node, graph, err)
+        axes_name = node.inputs[1]
+        if axes_name in node.input_tensors:
+            axes = node.input_tensors[axes_name]
     builder.add_expand_dims(
         name=node.name,
         input_name=node.inputs[0],
@@ -2255,6 +2302,95 @@ def _convert_where(builder, node, graph, err):
         input_names=node.inputs,
         output_name=node.outputs[0],
     )
+
+# add missing less than equal converter
+def _convert_lessorequal(builder: NeuralNetworkBuilder, node, graph, err):
+    load_input_constants(builder, node, graph, err)
+    builder.add_less_than(
+        name=node.name,
+        input_names=node.inputs,
+        output_name=node.outputs[0],
+        use_less_than_equal=True
+    )
+
+def _convert_hardsigmoid(builder: NeuralNetworkBuilder, node, graph, err):
+    load_input_constants(builder, node, graph, err)
+    const3name = node.name+'_const3'
+    builder.add_load_constant_nd(name=const3name, output_name=const3name, constant_value=np.array([[[3.0]]], dtype=np.float32), shape=[1, 1, 1])
+    const6rspname = node.name+'_const6rsp'
+    builder.add_load_constant_nd(name=const6rspname, output_name=const6rspname, constant_value=np.array([[[1.0/6.0]]], dtype=np.float32), shape=[1, 1, 1])
+    add3name = node.inputs[0]+'_add3'
+    builder.add_add_broadcastable(name=add3name, input_names=[node.inputs[0], const3name], output_name=add3name)
+    relu6name = node.inputs[0]+'_relu6'
+    builder.add_clamped_relu(
+        name=relu6name,
+        input_name=add3name,
+        output_name=relu6name
+    )
+    builder.add_multiply_broadcastable(name=node.inputs[0]+'_mul', input_names=[relu6name, const6rspname], output_name=node.outputs[0])
+
+def _convert_hardswish(builder: NeuralNetworkBuilder, node: Node, graph, err):
+    load_input_constants(builder, node, graph, err)
+    const3name = node.name+'_const3'
+    builder.add_load_constant_nd(name=const3name, output_name=const3name, constant_value=np.array([[[3.0]]], dtype=np.float32), shape=[1, 1, 1])
+    # builder.add_load_constant(name=const3name, output_name=const3name, constant_value=np.array([[[3.0]]], dtype=np.float32), shape=[1, 1, 1])
+    const6rspname = node.name+'_const6rsp'
+    builder.add_load_constant_nd(name=const6rspname, output_name=const6rspname, constant_value=np.array([[[1.0/6.0]]], dtype=np.float32), shape=[1, 1, 1])
+    add3name = node.inputs[0]+'_add3'
+    builder.add_add_broadcastable(name=add3name, input_names=[node.inputs[0], const3name], output_name=add3name)
+    relu6name = node.inputs[0]+'_relu6'
+    builder.add_clamped_relu(
+        name=relu6name,
+        input_name=add3name,
+        output_name=relu6name
+    )
+    hardsigmoidname = node.inputs[0]+'_hardsigmoid'
+    builder.add_multiply_broadcastable(name=node.inputs[0]+'_mul', input_names=[relu6name, const6rspname], output_name=hardsigmoidname)
+    builder.add_multiply_broadcastable(name=node.inputs[0]+'_mul2', input_names=[hardsigmoidname, node.inputs[0]], output_name=node.outputs[0])
+
+def _convert_scan(builder: NeuralNetworkBuilder, node: Node, graph, err):
+    '''
+    convert to CoreML WhereBroadcastable Layer:
+    https://github.com/apple/coremltools/blob/655b3be5cc0d42c3c4fa49f0f0e4a93a26b3e492/mlmodel/format/NeuralNetwork.proto#L3742
+    '''
+
+    load_input_constants(builder, node, graph, err)
+    # builder.add_loop(node.name, input_name=node.inputs[0], body_network=node.graph) 
+
+    # convert inner network, append to existing spec, it is simulating same results without scan operations,
+    # all batch will be running at the same time, limit the overall batchsize
+    from . import convert
+    body_inputs = node.graph.inputs
+    body_outputs = node.graph.outputs
+    default_batch_size = 1
+    batch_axes = 0
+    if len(body_inputs) != 1 and len(body_outputs) != 1:
+        raise ValueError('fail to convert scan node')
+
+    inputName, _, inputShape = body_inputs[0]
+    outputName, _, outputShape = body_outputs[0]
+    inputShape = list(inputShape)
+    inputShape[batch_axes] = default_batch_size
+    outputShape = list(outputShape)
+    outputShape[batch_axes] = default_batch_size
+    nn = convert(node.body, build_nn=False, minimum_ios_deployment_target='13', onnx_coreml_input_shape_map={inputName: inputShape}, onnx_coreml_output_shape_map={outputName: outputShape})
+    inputs = node.inputs
+    if len(inputs) != 1:
+        raise ValueError('fail to convert scan node')
+
+    spec = nn.get_spec()
+    neuralNetwork = spec.neuralNetwork
+
+    inputShape[batch_axes] = -1
+    builder.add_reshape_static('scan_reshape', node.inputs[0], 'scan/input', inputShape)
+    for i, layer in enumerate(neuralNetwork.layers):
+        if i == len(neuralNetwork.layers) - 1:
+            layer.output.pop()
+            layer.output.extend(node.outputs)
+
+        builder.nn_spec.layers.append(layer)
+    # builder.add_loop(node.name, input_name=node.inputs[0], body_network=nn.neuralNetwork) 
+    # builder.add_where_broadcastable( name=node.name, input_names=node.inputs, output_name=node.outputs[0],)
 
 _ONNX_NODE_REGISTRY_ND = {
     "Abs": _convert_abs,
@@ -2363,7 +2499,11 @@ _ONNX_NODE_REGISTRY_ND = {
     "Unsqueeze": _convert_unsqueeze,
     "Upsample": _convert_upsample,
     "Xor": _convert_logical,
-    "Where": _convert_where
+    "Where": _convert_where,
+    "Scan": _convert_scan,
+    'LessOrEqual': _convert_lessorequal,
+    'HardSwish' : _convert_hardswish,
+    'HardSigmoid' : _convert_hardsigmoid
 }
 
 def _get_node_converter_fn(builder, node, err):  # type: (NeuralNetworkBuilder, Node, ErrorHandling) -> Callable[[NeuralNetworkBuilder, Node, Graph, ErrorHandling], None]

@@ -822,7 +822,7 @@ class DeadCodeElimination(object):
     '''
     Removes nodes with unused outputs
     '''
-    def __call__(self, graph):  # type: (Graph) -> Graph
+    def __call__(self, graph, apply_input=True):  # type: (Graph) -> Graph
         input_names = [str(input_[0]) for input_ in graph.inputs]
         output_names = set([str(output_[0]) for output_ in graph.outputs])
         
@@ -862,7 +862,11 @@ class DeadCodeElimination(object):
             if _input not in uses:
                 for i in range(len(graph.inputs)):
                     if graph.inputs[i][0] is _input:
-                        graph.inputs.remove(graph.inputs[i])
+                        if apply_input:
+                            graph.inputs.remove(graph.inputs[i])
+                        else:
+                            transformed_nodes.append(Node('dummy', 'Shape', {}, [graph.inputs[i][0]], ['dummy_output']))
                         break
+
         
         return graph.create_graph(nodes=transformed_nodes)

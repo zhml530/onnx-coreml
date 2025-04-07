@@ -3,7 +3,7 @@ from __future__ import division
 from __future__ import print_function
 from __future__ import unicode_literals
 
-from onnx import numpy_helper, ValueInfoProto, AttributeProto, GraphProto, NodeProto, TensorProto, TensorShapeProto
+from onnx import helper, numpy_helper, ValueInfoProto, AttributeProto, GraphProto, NodeProto, TensorProto, TensorShapeProto, ModelProto
 from typing import Any, Text, Iterable, List, Dict, Sequence, Optional, Tuple, Union
 from typing_extensions import Protocol
 import numpy as np
@@ -93,6 +93,8 @@ class Node(object):
         self.parents = []  # type: List[Node]
         self.children = []  # type: List[Node]
         self.metadata = {}  # type: Dict[Any, Any]
+        self.body = None
+        self.graph = None
 
     def add_parent(self, parent_node):  # type: (Node) -> None
         assert parent_node not in self.parents
@@ -118,10 +120,25 @@ class Node(object):
         name = Text(node.name)
         if len(name) == 0:
             name = "_".join(node.output)
-        return Node(
+        node_ = Node(
             name, node.op_type, attrs, list(node.input), list(node.output)
         )
 
+        if node.op_type == 'Scan':
+            for attr in node.attribute:
+                if attr.name == 'body' and attr.type == 5:
+                    graph = attr.g
+                    ir_version = 8
+                    node_.body = Model.from_onnx(graph, ir_version=ir_version)
+                    node_.graph = Graph.from_onnx(graph, onnx_ir_version=ir_version)
+
+        return node_
+
+class Model(object):
+    @staticmethod
+    def from_onnx(graph, ir_version):
+        model = helper.make_model(graph=graph, ir_version=ir_version)
+        return model
 
 class Graph(object):
     def __init__(self,
